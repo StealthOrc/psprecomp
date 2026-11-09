@@ -14,6 +14,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "pgd.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,6 +49,7 @@
 #define PSP_O_TRUNC  0x0400
 
 #define ERR_ENOENT   0x80010002u
+#define ERR_EIO      0x80010005u
 #define ERR_EEXIST   0x80010011u
 #define ERR_EINVAL   0x80010016u
 #define ERR_EMFILE   0x80010018u
@@ -55,6 +57,7 @@
 #define ERR_BADF     0x80020323u
 #define ERR_ASYNC_BUSY 0x80020329u
 #define ERR_NOASYNC  0x8002032Au
+#define ERR_PGD_HEADER 0x80510204u
 
 /* An open file. Asynchronous operations complete at once -- the data is on a
  * host disk -- and park their result for sceIoWaitAsync / sceIoPollAsync. */
@@ -72,6 +75,8 @@ typedef struct {
      * is the position within it (the image's FILE is shared). */
     int     iso;
     int64_t pos;
+    uint32_t pgd_offset;
+    pgd_file *pgd;
     /* Memory-stick files (saves, DLC): what was done with them, logged at
      * close through psp_io_set_ms_log -- where save and DLC load time goes. */
     int      ms;
@@ -305,6 +310,7 @@ static const umd_entry *umd_find_lbn(uint32_t lbn) {
 void psp_io_reset(void) {
     for (int i = 0; i < MAX_FILES; i++) {
         if (g_file[i].used && g_file[i].f) fclose(g_file[i].f);
+        free(g_file[i].pgd);
         memset(&g_file[i], 0, sizeof g_file[i]);
     }
     memset(g_dir, 0, sizeof g_dir);
@@ -543,22 +549,62 @@ static void hle_Close(void) {
     }
     h->ms = 0;
     if (h->f) fclose(h->f);                 /* never the shared disc image (f is NULL for it) */
+    free(h->pgd);
+    h->pgd = NULL;
     h->f = NULL;
     h->used = 0;
     psp_ret(0);
 }
 
+/* Read from the original file window without changing its logical position. */
+static size_t raw_read_at(io_file *h, int64_t offset, void *dst, size_t size) {
+    if (h->limit >= 0) {
+        int64_t left = h->limit - offset;
+        if (left <= 0) return 0;
+        if ((uint64_t)left < size) size = (size_t)left;
+    }
+    FILE *f = h->iso ? g_iso : h->f;
+    if (!f || fseek64(f, h->base + offset, SEEK_SET) != 0) return 0;
+    return fread(dst, 1, size, f);
+}
+
+static int64_t read_pgd(io_file *h, uint8_t *dst, uint32_t size) {
+    pgd_file *pgd = h->pgd;
+    uint32_t done = 0;
+    while (done < size) {
+        uint32_t pos = (uint32_t)h->pos + done;
+        uint32_t offset = pos & ~(pgd->block_size - 1);
+        uint32_t within = pos - offset;
+        if (pgd->cached_offset != offset) {
+            uint32_t count = pgd->data_size - offset;
+            if (count > pgd->block_size) count = pgd->block_size;
+            size_t padded = (count + 15) & ~15u;
+            int64_t raw_offset = (int64_t)h->pgd_offset + pgd->data_offset + offset;
+            pgd->cached_offset = UINT32_MAX;
+            if (raw_read_at(h, raw_offset, pgd->block, padded) != padded)
+                return done ? (int64_t)done : (int32_t)ERR_EIO;
+            pgd_decrypt_block(pgd, offset, padded);
+        }
+        uint32_t count = pgd->block_size - within;
+        if (count > size - done) count = size - done;
+        memcpy(dst + done, pgd->block + within, count);
+        done += count;
+    }
+    return done;
+}
+
 static int64_t do_read(io_file *h, uint32_t dst, uint32_t size) {
     if (!h->f && !h->iso) return (int64_t)(int32_t)ERR_BADF;
     if (h->iso && !g_iso) return (int64_t)(int32_t)ERR_BADF;
-    if (h->limit >= 0) {                     /* a sector window ends where it ends */
-        int64_t at = h->iso ? h->pos : ftell64(h->f) - h->base;
-        int64_t left = h->limit - at;
+    int64_t limit = h->pgd ? h->pgd->data_size : h->limit;
+    if (limit >= 0) {                     /* a sector or PGD window ends where it ends */
+        int64_t at = h->iso || h->pgd ? h->pos : ftell64(h->f) - h->base;
+        int64_t left = limit - at;
         if (left <= 0) return 0;
         if ((int64_t)size > left) size = (uint32_t)left;
     }
     if (!size) return 0;
-    if (h->iso && fseek64(g_iso, h->base + h->pos, SEEK_SET) != 0) return 0;
+    if (h->iso && !h->pgd && fseek64(g_iso, h->base + h->pos, SEEK_SET) != 0) return 0;
 
     /* Read through a host buffer and then place it, so a read that straddles
      * the end of a guest region is rejected by the memory layer rather than
@@ -567,9 +613,15 @@ static int64_t do_read(io_file *h, uint32_t dst, uint32_t size) {
     if (!tmp) return (int64_t)(int32_t)SCE_KERNEL_ERROR_NO_MEMORY;
 
     const uint64_t t0 = h->ms ? psp_sched_now_us() : 0;
-    size_t got = fread(tmp, 1, size, h->iso ? g_iso : h->f);
+    int64_t result = h->pgd ? read_pgd(h, tmp, size)
+                           : (int64_t)fread(tmp, 1, size, h->iso ? g_iso : h->f);
+    if (result < 0) {
+        free(tmp);
+        return result;
+    }
+    size_t got = (size_t)result;
     if (h->ms) { h->reads++; h->bytes += got; h->read_us += psp_sched_now_us() - t0; }
-    if (h->iso) h->pos += (int64_t)got;
+    if (h->iso || h->pgd) h->pos += (int64_t)got;
     if (got && psp_mem_write_block(dst, tmp, (uint32_t)got) != 0) {
         /* Fall back to byte-at-a-time so a partially mapped destination still
          * gets what fits, and the bad-access counter records the rest. */
@@ -625,7 +677,7 @@ static void hle_Write(void) {
         psp_ret(size);
         return;
     }
-    if (!h || !h->f) { psp_ret(ERR_BADF); return; }
+    if (!h || !h->f || h->pgd) { psp_ret(ERR_BADF); return; }
 
     uint8_t *tmp = (uint8_t *)malloc(size ? size : 1);
     if (!tmp) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
@@ -644,13 +696,16 @@ static void hle_Lseek(void) {
     if (h && h->ms) h->seeks++;
     uint64_t off = (uint64_t)psp_arg(2) | ((uint64_t)psp_arg(3) << 32);
     uint32_t whence = psp_arg(4);
-    if (h && h->iso) {                      /* positions within the image window */
-        int64_t target = whence == 1 ? h->pos + (int64_t)off : whence == 2 ? h->limit + (int64_t)off : (int64_t)off;
-        if (target < 0) {
+    if (h && (h->iso || h->pgd)) {          /* positions within the image or decrypted window */
+        int64_t end = h->pgd ? h->pgd->data_size : h->limit;
+        int64_t base = whence == 1 ? h->pos : whence == 2 ? end : 0;
+        int64_t delta = (int64_t)off;
+        if (whence > 2 || delta < -base || delta > INT64_MAX - base) {
             psp_cpu.r[PSP_REG_V0] = ERR_EINVAL;
             psp_cpu.r[PSP_REG_V1] = 0xFFFFFFFFu;
             return;
         }
+        int64_t target = base + delta;
         h->pos = target;
         psp_cpu.r[PSP_REG_V0] = (uint32_t)target;
         psp_cpu.r[PSP_REG_V1] = (uint32_t)((uint64_t)target >> 32);
@@ -850,9 +905,63 @@ static void hle_Devctl(void) {
     psp_ret(ERR_ENOTSUP);
 }
 
+static uint32_t open_pgd(io_file *h, uint32_t addr, uint32_t len) {
+    uint8_t key[16], header[PGD_HEADER_SIZE];
+    if (len && (len != sizeof key || !addr || psp_mem_read_block(key, addr, sizeof key) != 0))
+        return ERR_EINVAL;
+
+    int64_t saved = 0, limit = h->limit;
+    if (h->f) {
+        saved = ftell64(h->f);
+        if (saved < 0) return ERR_EIO;
+        if (limit < 0) {
+            if (fseek64(h->f, 0, SEEK_END) != 0) return ERR_EIO;
+            limit = ftell64(h->f);
+        }
+    }
+    size_t count = raw_read_at(h, h->pgd_offset, header, sizeof header);
+    if (h->f && fseek64(h->f, saved, SEEK_SET) != 0) return ERR_EIO;
+    if (count < 4 || memcmp(header, "\0PGD", 4) != 0) return ERR_PGD_HEADER;
+    if (count != sizeof header || limit < h->pgd_offset) return ERR_PGD_HEADER;
+
+    pgd_file *pgd = pgd_open(header, len ? key : NULL, (uint64_t)(limit - h->pgd_offset));
+    if (!pgd) return ERR_PGD_HEADER;
+    free(h->pgd);
+    h->pgd = pgd;
+    h->pos = 0;
+    if (tracing()) fprintf(stderr, "sceIoIoctl: opened PGD (%u plaintext bytes)\n", pgd->data_size);
+    return 0;
+}
+
 static void hle_Ioctl(void) {
+    uint32_t cmd = psp_arg(1);
+    if (cmd == 0x04100001 || cmd == 0x04100002 || cmd == 0x04100010) {
+        io_file *h = fd_arg();
+        if (!h || (h->iso ? !g_iso : !h->f)) { psp_ret(ERR_BADF); return; }
+        if (h->async_pending) { psp_ret(ERR_ASYNC_BUSY); return; }
+        if (cmd == 0x04100001) {
+            psp_ret(open_pgd(h, psp_arg(2), psp_arg(3)));
+        } else if (cmd == 0x04100002) {
+            uint32_t offset = psp_arg(2);
+            if (psp_arg(3) == 4) {
+                uint8_t bytes[4];
+                if (!offset || psp_mem_read_block(bytes, offset, sizeof bytes) != 0) {
+                    psp_ret(ERR_EINVAL);
+                    return;
+                }
+                offset = le32(bytes);
+            }
+            free(h->pgd);
+            h->pgd = NULL;
+            h->pgd_offset = offset;
+            psp_ret(0);
+        } else {
+            psp_ret(h->pgd ? h->pgd->data_size : ERR_ENOTSUP);
+        }
+        return;
+    }
     fprintf(stderr, "psprecomp: sceIoIoctl(fd %d, 0x%08X) not implemented\n",
-            (int32_t)psp_arg(0), psp_arg(1));
+            (int32_t)psp_arg(0), cmd);
     psp_ret(ERR_ENOTSUP);
 }
 

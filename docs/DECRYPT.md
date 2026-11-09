@@ -159,6 +159,11 @@ a wrong key produces a named diagnostic (`key 'kirk1' not found in
 keys/psp_keys.txt`) instead of a mysterious failure, and a correction needs no
 rebuild.
 
+### PGD archives at run time
+
+Set `PSPRECOMP_KEYS` to an external key file you supply. The runtime also
+looks for `keys/psp_keys.txt` relative to the working directory.
+
 ## The pragmatic unblock
 
 Phase 2b is not on the critical path for *recompilation*. Phase 3 — function

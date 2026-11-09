@@ -31,6 +31,15 @@ endif()
 
 # --- the runtime library ------------------------------------------------------
 
+add_library(psprecomp_crypto STATIC
+    tools/allegrexrecomp/keys.c
+    tools/allegrexrecomp/crypto/aes.c
+    tools/allegrexrecomp/crypto/cmac.c
+)
+target_include_directories(psprecomp_crypto PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools/allegrexrecomp/crypto
+)
+
 add_library(psprecomp STATIC
     src/cpu.c
     src/mem.c
@@ -47,6 +56,7 @@ add_library(psprecomp STATIC
     src/hle/ge_vertex.c
     src/hle/sascore.c
     src/hle/iofilemgr.c
+    src/hle/pgd.c
     src/hle/misc.c
     src/hle/system.c
     src/hle/modules.c
@@ -59,9 +69,11 @@ add_library(psprecomp STATIC
     src/hle/http.c
     src/hle/offline.c
 )
+target_link_libraries(psprecomp PRIVATE psprecomp_crypto)
 
 target_include_directories(psprecomp PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools/allegrexrecomp
 )
 
 # Networking HLE (src/hle/net.c) uses the host's sockets and adapter list.

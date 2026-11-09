@@ -9,12 +9,10 @@ add_library(allegrex_core STATIC
     container.c
     analyze.c
     emit.c
-    keys.c
-    crypto/aes.c
-    crypto/cmac.c
     crypto/sha1.c
     crypto/kirk.c
 )
+target_link_libraries(allegrex_core PRIVATE psprecomp_crypto)
 
 target_include_directories(allegrex_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
