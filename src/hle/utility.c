@@ -58,6 +58,8 @@ enum { ST_NONE = 0, ST_INIT = 1, ST_RUNNING = 2, ST_FINISHED = 3, ST_SHUTDOWN = 
 #define SAVEDATA_SAVE_ACCESS_ERR  0x80110385u
 #define UTILITY_INVALID_PARAM     0x80110001u   /* used for modes not implemented */
 
+static void dump_key(uint32_t p);
+
 static const psp_savedata_crypto *g_crypto;
 void psp_savedata_set_crypto(const psp_savedata_crypto *c) { g_crypto = c; }
 
